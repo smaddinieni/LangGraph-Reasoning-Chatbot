@@ -1,0 +1,9 @@
+langgraph
+langchain
+ipython
+langchain-openai
+langchain_community
+dotenv
+typing
+ipykernel
+ruff
