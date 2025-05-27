@@ -38,3 +38,4 @@ ENV/
 .ruff_cache/
 __pycache__/
 Notebooks/
+.files/
