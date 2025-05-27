@@ -46,6 +46,7 @@ async def start_chat():
 async def handle_message(message: cl.Message):
     """
     Processes incoming user messages and streams the chatbot's response.
+    Handles uploaded files as context.
     """
     chatbot_instance = cl.user_session.get("chatbot")  # type: LangGraphChatbot
     thread_id = cl.user_session.get("thread_id")
@@ -56,25 +57,64 @@ async def handle_message(message: cl.Message):
         ).send()
         return
 
-    user_input = message.content
+    # --- File Handling Logic ---
+    uploaded_files = [element for element in message.elements if isinstance(element, cl.File)]
+    file_context_for_llm = []
+    processed_files_info = [] # To inform the user which files were processed
+
+    if uploaded_files:
+        await cl.Message(content=f"Received {len(uploaded_files)} file(s). Processing...").send()
+        for file_element in uploaded_files:
+            if "text" in file_element.mime or \
+               any(file_element.name.endswith(ext) for ext in [".txt", ".md", ".py", ".csv", ".json"]):
+                try:
+                    # Read the file content from its temporary path
+                    with open(file_element.path, "r", encoding="utf-8") as f:
+                        text_content = f.read()
+
+                    # Prepare context for the LLM
+                    file_context_for_llm.append(
+                        f"\n\n--- Content from uploaded file: {file_element.name} ---\n"
+                        f"{text_content}"
+                        f"\n--- End of content from: {file_element.name} ---\n"
+                    )
+                    processed_files_info.append(f"Successfully processed and included content from: {file_element.name}")
+                except Exception as e:
+                    error_msg = f"Error processing file {file_element.name}: {e}"
+                    processed_files_info.append(error_msg)
+                    print(error_msg) # Log to server
+            else:
+                processed_files_info.append(
+                    f"Received file: {file_element.name} (MIME: {file_element.mime}). "
+                    "This demo primarily processes text-based files for context."
+                )
+
+        # Inform the user about file processing results
+        if processed_files_info:
+            await cl.Message(content="\n".join(processed_files_info)).send()
+    # --- End of File Handling Logic ---
+
+    # Combine user's typed message with context from files
+    final_user_input = message.content
+    if file_context_for_llm:
+        final_user_input = "".join(file_context_for_llm) + "\n\nUser's question or message: " + message.content
+
+    # Send the combined input to the chatbot
     msg_ui = cl.Message(content="")  # Create an empty message in the UI to stream into
     await msg_ui.send()
 
     full_response = ""
     try:
-        async for token in chatbot_instance.get_response_stream(user_input, thread_id):
+        # The get_response_stream method in your chatbot will receive the combined input
+        async for token in chatbot_instance.get_response_stream(final_user_input, thread_id):
             await msg_ui.stream_token(token)
             full_response += token
         
-        # Once streaming is done, update the message if you need to store the full response
-        # or if stream_token doesn't finalize it as desired.
-        # msg_ui.content = full_response # Usually not needed as stream_token updates UI
         await msg_ui.update()
 
     except Exception as e:
-        error_message = f"Sorry, an error occurred while processing your request: {str(e)}"
-        await cl.ErrorMessage(content=error_message).send()
-        print(f"Error during handle_message: {e}") # Log to server console
-        # Optionally, update the message UI with an error state
+        error_message_for_ui = f"Sorry, an error occurred while processing your request: {str(e)}"
+        await cl.ErrorMessage(content=error_message_for_ui).send()
+        print(f"Error during handle_message: {e}")
         msg_ui.content = "An error occurred. Please check the logs."
         await msg_ui.update()

@@ -7,3 +7,5 @@ dotenv
 typing
 ipykernel
 ruff
+pypdf2
+python-docx
