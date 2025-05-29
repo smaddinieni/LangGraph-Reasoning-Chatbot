@@ -9,3 +9,5 @@ ipykernel
 ruff
 pypdf2
 python-docx
+mcp
+langchain-mcp-adapters
