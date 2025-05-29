@@ -63,7 +63,7 @@ class LangGraphChatbot:
             
         try:
             self.mcp_client = MultiServerMCPClient({
-                "math": {
+                "DXC Document Search": {
                     "command": "python",
                     "args": ["mcp_server.py"],
                     "transport": "stdio",
