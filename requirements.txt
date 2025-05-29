@@ -11,3 +11,6 @@ pypdf2
 python-docx
 mcp
 langchain-mcp-adapters
+fastmcp
+azure-search-documents
+azure-core
