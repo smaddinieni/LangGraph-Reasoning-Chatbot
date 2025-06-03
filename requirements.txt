@@ -14,3 +14,4 @@ langchain-mcp-adapters
 fastmcp
 azure-search-documents
 azure-core
+pyodbc

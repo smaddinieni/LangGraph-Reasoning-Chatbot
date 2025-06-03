@@ -1,132 +1,220 @@
 import os
-import asyncio
-from typing import Annotated, List, AsyncGenerator, TypedDict, Optional
-
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.prebuilt import create_react_agent
-
+import logging
+from typing import List, AsyncGenerator, Optional, Dict, Any
+import pyodbc
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.tools import BaseTool
 from langchain_openai import AzureChatOpenAI
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
+from langchain_mcp_adapters.client import MultiServerMCPClient # Assuming this is your actual working import
+conn_str = os.getenv("SQL_CONN_STR")
+
+logging.basicConfig(
+    level=logging.ERROR, # Set to ERROR or higher for production
+    format="%(asctime)s [%(levelname)s] %(name)s (%(module)s.%(funcName)s): %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_CHAT_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt41")
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4o-mini")
 OPENAI_API_VERSION = os.getenv("OPENAI_API_VERSION", "2024-02-01")
 
-class State(TypedDict):
-    """State schema for the chatbot graph."""
-    messages: Annotated[List[BaseMessage], add_messages]
+def log_to_sql(session_id, user_id, prompt, response, is_error=False, metadata=None):
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO chainlit_logs (session_id, user_id, prompt, response, is_error, metadata)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        session_id, user_id, prompt, response, int(is_error), metadata
+    )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
 
 class LangGraphChatbot:
     """
-    LangGraph-based chatbot with Azure OpenAI integration and MCP server support.
-    
-    Provides both tool-enabled and fallback direct LLM interaction modes.
+    LangGraph-based chatbot using a ReAct agent with Azure OpenAI and MCP tool integration.
+    This class manages the agent, tool loading, and streaming responses for Chainlit.
     """
-    
-    def __init__(self):
-        """Initialize the chatbot with Azure OpenAI model and memory."""
-        if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_CHAT_DEPLOYMENT_NAME, OPENAI_API_VERSION]):
+
+    def __init__(self) -> None:
+        """
+        Initialize the chatbot with Azure OpenAI model and in-memory conversation memory.
+        Raises:
+            ValueError: If required Azure OpenAI environment variables are not set.
+        """
+        if not all([AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY]):
+            logger.error("Azure OpenAI environment variables (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY) not set.")
             raise ValueError(
-                "Azure OpenAI environment variables not set. "
-                "Please ensure AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, "
-                "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME, and OPENAI_API_VERSION are in your .env file."
+                "Required Azure OpenAI environment variables not set. "
+                "Please ensure AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY are configured."
             )
 
-        self.model = AzureChatOpenAI(
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_key=AZURE_OPENAI_API_KEY,
-            azure_deployment=AZURE_OPENAI_CHAT_DEPLOYMENT_NAME,
-            api_version=OPENAI_API_VERSION,
-            max_tokens=2048,
-            temperature=0.1,
-            streaming=True
-        )
-        self.memory = MemorySaver()
-        self.mcp_client: Optional[MultiServerMCPClient] = None
-        self.tools: List = []
-        self.graph = None
+        try:
+            self.model: AzureChatOpenAI = AzureChatOpenAI(
+                azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                api_key=AZURE_OPENAI_API_KEY,
+                azure_deployment=AZURE_OPENAI_CHAT_DEPLOYMENT_NAME,
+                api_version=OPENAI_API_VERSION,
+                max_tokens=1024,
+                temperature=0.7,
+                streaming=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize AzureChatOpenAI model: {e}", exc_info=True)
+            raise RuntimeError(f"Could not initialize Azure LLM: {e}")
+
+        self.tools: List[BaseTool] = []
+        self.agent_executor = None
+        self.checkpointer = InMemorySaver()
         self._initialized = False
+
 
     async def initialize(self) -> None:
         """
-        Asynchronously initialize MCP client and tools.
-        
-        This method must be called after creating the chatbot instance
-        to properly set up the MCP tools and graph.
+        Initialize MCP client, load tools, and create the ReAct agent with memory.
+        This method can be called multiple times but will only run full initialization once.
         """
         if self._initialized:
             return
-            
+
         try:
-            self.mcp_client = MultiServerMCPClient({
-                "DXC Document Search": {
+            mcp_client = MultiServerMCPClient({
+                "DXC_Document_Search": {
                     "command": "python",
-                    "args": ["mcp_server.py"],
+                    "args": ["mcp_server01.py"],
+                    "transport": "stdio",
+                },
+                "SQL_Server": {
+                    "command": "python",
+                    "args": ["mcp_server02.py"],
                     "transport": "stdio",
                 },
             })
-            
-            # Properly await the async get_tools method
-            self.tools = await self.mcp_client.get_tools()
-            
-            if self.tools:
-                print(f"Successfully loaded tools from MCP server: {[tool.name for tool in self.tools]}")
-            else:
-                print("Warning: No tools loaded from MCP server, but client initialized.")
-                self.tools = [] 
+            self.tools = await mcp_client.get_tools()
         except Exception as e:
-            print(f"Failed to initialize MCP client or get tools: {e}")
+            logger.error(f"Failed to initialize/load MCP tools: {e}", exc_info=True)
             self.tools = []
-            self.mcp_client = None
 
-        # Build the graph based on available tools
-        await self._build_graph()
+        if not self.model:
+            logger.error("self.model is None before creating ReAct agent. Azure LLM failed to init.")
+            self._initialized = False
+            raise RuntimeError("AzureChatOpenAI model (self.model) is not initialized properly.")
+
+        try:
+            self.agent_executor = create_react_agent(
+                model=self.model,
+                tools=self.tools,
+                checkpointer=self.checkpointer,
+            )
+        except Exception as e:
+            logger.error(f"Failed to create ReAct agent executor: {e}", exc_info=True)
+            self._initialized = False
+            self.agent_executor = None
+            raise
+
         self._initialized = True
 
-    async def _build_graph(self) -> None:
-        """Build the LangGraph based on available tools."""
-        if self.tools:
-            self.graph = create_react_agent(self.model, self.tools,prompt="You are an helpful AI agent", checkpointer=self.memory)
-            print("Compiled graph with tools using create_react_agent.")
-        else:
-            graph_builder = StateGraph(State)
-            graph_builder.add_node("chatbot", self._direct_llm_node)
-            graph_builder.add_edge(START, "chatbot")
-            graph_builder.add_edge("chatbot", END)
-            self.graph = graph_builder.compile(checkpointer=self.memory)
-            print("Warning: MCP tools not loaded. Compiled graph without tools (fallback to direct LLM).")
 
-    def _direct_llm_node(self, state: State) -> dict:
-        """Direct LLM node for fallback when no tools are available."""
-        response_message = self.model.invoke(state["messages"])
-        return {"messages": [response_message]}
-
-    async def get_response_stream(self, user_input: str, thread_id: str) -> AsyncGenerator[str, None]:
+    async def get_response_stream(self, user_input: str, thread_id: str, user_id: Optional[str] = "anonymous") -> AsyncGenerator[str, None]:
         """
-        Generate streaming response for user input.
-        
+        Generate streaming response for user input with conversation memory and log interaction to SQL.
         Args:
-            user_input: The user's message
-            thread_id: Unique identifier for the conversation thread
-            
+            user_input: The user's message.
+            thread_id: Unique conversation thread identifier for memory persistence.
+            user_id: The user's identifier (default: "anonymous").
         Yields:
-            str: Streaming response chunks
+            str: Response content chunks as they are generated.
         """
         if not self._initialized:
-            await self.initialize()
-            
-        config = {"configurable": {"thread_id": thread_id}}
-        graph_input = {"messages": [HumanMessage(content=user_input)]}
+            try:
+                await self.initialize()
+            except Exception as e:
+                logger.error(f"Error during self.initialize() in get_response_stream: {e}", exc_info=True)
+                # Log error to SQL
+                log_to_sql(
+                    session_id=thread_id,
+                    user_id=user_id,
+                    prompt=user_input,
+                    response=f"Error: Chatbot failed to initialize during request: {e}",
+                    is_error=True,
+                    metadata=None
+                )
+                yield f"Error: Chatbot failed to initialize during request: {e}"
+                return
 
-        async for event in self.graph.astream_events(graph_input, config=config, version="v2"):
-            kind = event["event"]
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                if isinstance(chunk, AIMessage) and chunk.content:
-                    yield chunk.content
-            elif kind == "on_tool_end":
-                pass
+        if not self.agent_executor:
+            logger.error("self.agent_executor is None after initialization attempt in get_response_stream.")
+            # Log error to SQL
+            log_to_sql(
+                session_id=thread_id,
+                user_id=user_id,
+                prompt=user_input,
+                response="Error: Agent executor not available after initialization.",
+                is_error=True,
+                metadata=None
+            )
+            yield "Error: Agent executor not available after initialization."
+            return
+
+        config = {"configurable": {"thread_id": thread_id}}
+        messages_for_agent: List[BaseMessage] = [HumanMessage(content=user_input)]
+        current_ai_response_content = ""
+        final_ai_response = ""
+
+        try:
+            async for chunk_event in self.agent_executor.astream({"messages": messages_for_agent}, config=config):
+                messages_in_chunk: Optional[List[BaseMessage]] = None
+                for key, value in chunk_event.items():
+                    if isinstance(value, dict) and "messages" in value and isinstance(value["messages"], list):
+                        if all(isinstance(m, BaseMessage) for m in value["messages"]):
+                            messages_in_chunk = value["messages"]
+                            break
+                    elif key == "messages" and isinstance(value, list):
+                        if all(isinstance(m, BaseMessage) for m in value):
+                            messages_in_chunk = value
+                            break
+
+                if messages_in_chunk:
+                    last_message = messages_in_chunk[-1]
+                    if isinstance(last_message, AIMessage) and hasattr(last_message, 'content'):
+                        full_content_of_last_ai_message = last_message.content
+                        if full_content_of_last_ai_message.startswith(current_ai_response_content):
+                            new_token_piece = full_content_of_last_ai_message[len(current_ai_response_content):]
+                            if new_token_piece:
+                                yield new_token_piece
+                                current_ai_response_content = full_content_of_last_ai_message
+                                final_ai_response = full_content_of_last_ai_message
+                        elif not current_ai_response_content and full_content_of_last_ai_message:
+                            yield full_content_of_last_ai_message
+                            current_ai_response_content = full_content_of_last_ai_message
+                            final_ai_response = full_content_of_last_ai_message
+            # Log successful interaction to SQL
+            log_to_sql(
+                session_id=thread_id,
+                user_id=user_id,
+                prompt=user_input,
+                response=final_ai_response,
+                is_error=False,
+                metadata=None
+            )
+        except Exception as e:
+            logger.error(f"Error during agent_executor.astream: {e}", exc_info=True)
+            # Log error to SQL
+            log_to_sql(
+                session_id=thread_id,
+                user_id=user_id,
+                prompt=user_input,
+                response=f"Error: Agent streaming failed unexpectedly: {e}",
+                is_error=True,
+                metadata=None
+            )
+            yield f"Error: Agent streaming failed unexpectedly: {e}"
+            return
