@@ -106,6 +106,42 @@ def select_from_table(
 
 
 @mcp.tool()
+def get_table_schema(table: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves the schema (column names, data types, nullability, etc.) of the specified table.
+
+    Args:
+        table (str): The name of the table whose schema is to be retrieved.
+
+    Returns:
+        List[Dict[str, Any]]: A list of dictionaries, each representing a column with its metadata.
+
+    Raises:
+        ValueError: If the table is 'chainlit_logs' or does not exist.
+    """
+    _ensure_not_chainlit_logs(table)
+    query = """
+        SELECT 
+            COLUMN_NAME, 
+            DATA_TYPE, 
+            CHARACTER_MAXIMUM_LENGTH, 
+            IS_NULLABLE, 
+            COLUMN_DEFAULT
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, [table])
+        columns = [column[0] for column in cursor.description]
+        schema = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        if not schema:
+            raise ValueError(f"Table '{table}' does not exist or has no columns.")
+        return schema
+
+
+@mcp.tool()
 def insert_into_table(
     table: str,
     data: Dict[str, Any]

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_CHAT_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4o-mini")
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4o")
 OPENAI_API_VERSION = os.getenv("OPENAI_API_VERSION", "2024-02-01")
 
 def log_to_sql(session_id, user_id, prompt, response, is_error=False, metadata=None):
@@ -63,8 +63,8 @@ class LangGraphChatbot:
                 api_key=AZURE_OPENAI_API_KEY,
                 azure_deployment=AZURE_OPENAI_CHAT_DEPLOYMENT_NAME,
                 api_version=OPENAI_API_VERSION,
-                max_tokens=1024,
-                temperature=0.7,
+                max_tokens=5000,
+                temperature=0.2,
                 streaming=True
             )
         except Exception as e:
@@ -72,6 +72,7 @@ class LangGraphChatbot:
             raise RuntimeError(f"Could not initialize Azure LLM: {e}")
 
         self.tools: List[BaseTool] = []
+        self.agent = None
         self.agent_executor = None
         self.checkpointer = InMemorySaver()
         self._initialized = False
@@ -109,11 +110,12 @@ class LangGraphChatbot:
             raise RuntimeError("AzureChatOpenAI model (self.model) is not initialized properly.")
 
         try:
-            self.agent_executor = create_react_agent(
+            self.agent = create_react_agent(
                 model=self.model,
                 tools=self.tools,
                 checkpointer=self.checkpointer,
             )
+            self.agent_executor = self.agent.with_config(recursion_limit=50)
         except Exception as e:
             logger.error(f"Failed to create ReAct agent executor: {e}", exc_info=True)
             self._initialized = False
